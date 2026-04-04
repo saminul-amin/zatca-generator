@@ -1,0 +1,33 @@
+# Sensitive files - private keys and certificates
+*.pem
+private_key.*
+csr.pem
+csr.txt
+
+# ZATCA credentials and tokens
+ccsid.json
+pcsid.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
