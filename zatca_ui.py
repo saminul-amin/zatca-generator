@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 import requests
 import streamlit as st
 
+import invoice_signer
+
 # ═══════════════════════════════════════════════════════════
 # PAGE CONFIG
 # ═══════════════════════════════════════════════════════════
@@ -60,7 +62,8 @@ INVOICE_TYPES = {
     "0100": "Retail customers only (B2C)",
 }
 
-STEPS = ["Business details", "Verify with OTP", "Activate", "Download"]
+STEPS = ["Business details", "Verify with OTP", "Test invoices", "Activate", "Download"]
+LAST_STEP = len(STEPS)
 
 SAMPLE_VAT = "399999999900003"
 
@@ -175,6 +178,27 @@ header[data-testid="stHeader"] { background: transparent; }
 .howto li { margin: 4px 0; }
 .howto a { color: var(--brand); font-weight: 600; }
 
+/* ── Test invoice results ── */
+.check-list {
+    display: grid; gap: 8px; margin: 2px 0 4px;
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+}
+.check-row {
+    display: flex; gap: 10px; align-items: flex-start;
+    padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: #FAFCFB;
+}
+.check-icon {
+    width: 26px; height: 26px; border-radius: 50%; flex-shrink: 0;
+    display: grid; place-items: center;
+}
+.check-icon .ico { width: 14px; height: 14px; }
+.check-row.ok .check-icon { background: var(--brand-soft); color: var(--brand); }
+.check-row.fail { border-color: #F3C9C9; background: #FFF7F7; }
+.check-row.fail .check-icon { background: #FDE3E3; color: #B42318; }
+.check-label { font-weight: 600; font-size: .9rem; color: var(--ink); }
+.check-note { font-size: .82rem; color: var(--muted); margin-top: 1px; }
+.check-row.fail .check-note { color: #B42318; }
+
 /* ── Success panel ── */
 .success-panel {
     text-align: center; padding: 22px 18px 8px;
@@ -213,6 +237,7 @@ header[data-testid="stHeader"] { background: transparent; }
 
 ICONS = {
     "check": '<polyline points="20 6 9 17 4 12"/>',
+    "x": '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
     "receipt": '<path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1Z"/>'
                '<path d="M8 8h8"/><path d="M8 12h8"/><path d="M8 16h5"/>',
 }
@@ -260,7 +285,8 @@ PROGRESS_KEYS = {
     "csr_pem": None,
     "csr_base64": None,
     "ccsid": None,            # compliance certificate (step 2)
-    "pcsid": None,            # production certificate (step 3)
+    "compliance": None,       # test invoice results (step 3)
+    "pcsid": None,            # production certificate (step 4)
     "error": None,            # {"step": n, "message": str, "log": str}
     "log": {},                # technical log per step
 }
@@ -285,9 +311,11 @@ def current_step():
         return 1
     if s.ccsid is None:
         return 2
-    if s.pcsid is None:
+    if not (s.compliance and s.compliance["all_passed"]):
         return 3
-    return 4
+    if s.pcsid is None:
+        return 4
+    return LAST_STEP
 
 
 # ═══════════════════════════════════════════════════════════
@@ -401,9 +429,9 @@ def explain_failure(step, status, body_text):
     if step == 2 and "otp" in lower:
         return ("ZATCA did not accept the one-time password (OTP). It may be mistyped, "
                 "already used, or expired (codes last 1 hour). Get a new code and try again.")
-    if step == 3 and "compliance" in lower:
-        return ("ZATCA says the compliance checks aren't finished yet. Your invoicing software "
-                "must send ZATCA's sample invoices first; then come back and activate again.")
+    if step == 4 and "compliance" in lower:
+        return ("ZATCA says the test invoices haven't all passed yet. Use Start over to run "
+                "the whole process again.")
     if status in (401, 403):
         return "ZATCA refused the request because it couldn't confirm who you are."
     if status >= 500:
@@ -463,7 +491,94 @@ def request_production_csid(env, ccsid):
         "Authorization": f"Basic {credentials}",
     }
     body = {"compliance_request_id": str(ccsid["requestID"])}
-    return call_zatca(3, f"{ENVIRONMENTS[env]['url']}/production/csids", headers, body)
+    return call_zatca(4, f"{ENVIRONMENTS[env]['url']}/production/csids", headers, body)
+
+
+DOC_LABELS = {
+    "STDSI": "Tax invoice (B2B)",
+    "STDCN": "Tax credit note (B2B)",
+    "STDDN": "Tax debit note (B2B)",
+    "SIMSI": "Simplified invoice (B2C)",
+    "SIMCN": "Simplified credit note (B2C)",
+    "SIMDN": "Simplified debit note (B2C)",
+}
+
+
+def _validation_messages(validation, key):
+    return [
+        m.get("message") or m.get("code") or json.dumps(m)
+        for m in (validation.get(key) or [])
+        if isinstance(m, dict)
+    ]
+
+
+def run_compliance_checks(details, ccsid, private_key_pem):
+    """Create, sign and submit the sample documents ZATCA requires before activation."""
+    logs = []
+    try:
+        certificate = base64.b64decode(ccsid["binarySecurityToken"]).decode("utf-8")
+        invoices = invoice_signer.generate_all_compliance_invoices(
+            certificate, private_key_pem,
+            seller_name=details["organization"],
+            seller_vat=details["tax_number"],
+            invoice_type_code=details["invoice_type"],
+        )
+    except Exception as e:
+        logs.append(f"Signing failed: {e!r}")
+        return None, "Could not create the test invoices. Please start over and try again.", "\n".join(logs)
+
+    url = f"{ENVIRONMENTS[details['env']]['url']}/compliance/invoices"
+    credentials = base64.b64encode(
+        f"{ccsid['binarySecurityToken']}:{ccsid['secret']}".encode()
+    ).decode()
+    headers = {
+        "accept": "application/json",
+        "accept-language": "en",
+        "Accept-Version": "V2",
+        "Content-Type": "application/json",
+        "Authorization": f"Basic {credentials}",
+    }
+
+    results = []
+    for inv in invoices:
+        row = {"label": DOC_LABELS.get(inv["prefix"], inv["label"]), "ok": False,
+               "status": "", "errors": [], "warnings": []}
+        logs.append(f"POST {url}  [{inv['prefix']}]")
+        try:
+            resp = requests.post(
+                url, json={k: inv[k] for k in ("invoiceHash", "uuid", "invoice")},
+                headers=headers, timeout=30,
+            )
+        except requests.RequestException as e:
+            logs.append(f"  Network error: {e}")
+            row["errors"] = ["Could not reach ZATCA."]
+            results.append(row)
+            continue
+
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        validation = data.get("validationResults") or {}
+        row["status"] = data.get("clearanceStatus") or data.get("reportingStatus") or ""
+        row["errors"] = _validation_messages(validation, "errorMessages")
+        row["warnings"] = _validation_messages(validation, "warningMessages")
+        row["ok"] = resp.status_code in (200, 202) and row["status"] in ("CLEARED", "REPORTED")
+        if not row["ok"] and not row["errors"]:
+            row["errors"] = [explain_failure(3, resp.status_code, resp.text)]
+
+        logs.append(f"  HTTP {resp.status_code} {row['status']} {validation.get('status', '')}")
+        logs.extend(f"  error: {m}" for m in row["errors"])
+        logs.extend(f"  warning: {m}" for m in row["warnings"])
+        results.append(row)
+
+    all_passed = all(r["ok"] for r in results)
+    err = None
+    if not all_passed:
+        failed = sum(not r["ok"] for r in results)
+        err = (f"{failed} of {len(results)} test documents were not accepted. "
+               "Check the reasons above, then press Try again.")
+    return {"results": results, "all_passed": all_passed}, err, "\n".join(logs)
 
 
 def build_settings_export(details, s):
@@ -545,6 +660,7 @@ def validate_details(d):
 CHECK_ICON = '<span class="ico ico-check"></span>'
 LOGO_ICON = '<span class="ico ico-receipt"></span>'
 BIG_CHECK_ICON = '<span class="ico ico-check ico-lg"></span>'
+X_ICON = '<span class="ico ico-x"></span>'
 
 
 def esc(value):
@@ -569,7 +685,7 @@ def render_header(env):
 def render_stepper(active):
     items = []
     for i, label in enumerate(STEPS, start=1):
-        if i < active or active == 4:
+        if i < active or active == LAST_STEP:
             cls, dot = "done", CHECK_ICON
         elif i == active:
             cls, dot = "current", str(i)
@@ -606,6 +722,25 @@ def step_state(num, active):
     if num < active:
         return "done"
     return "current" if num == active else "locked"
+
+
+def render_compliance_results(results):
+    rows = []
+    for r in results:
+        if r["ok"]:
+            icon, cls = CHECK_ICON, "ok"
+            note = "Accepted by ZATCA"
+            if r["warnings"]:
+                note += f" with {len(r['warnings'])} warning(s): " + "; ".join(r["warnings"][:2])
+        else:
+            icon, cls = X_ICON, "fail"
+            note = "; ".join(r["errors"][:2]) or "Not accepted"
+        rows.append(
+            f'<div class="check-row {cls}"><span class="check-icon">{icon}</span><div>'
+            f'<div class="check-label">{esc(r["label"])}</div>'
+            f'<div class="check-note">{esc(note)}</div></div></div>'
+        )
+    st.html(f'<div class="check-list">{"".join(rows)}</div>')
 
 
 def show_error(step):
@@ -745,7 +880,7 @@ with st.container(border=True, key=f"card-{state1}-1"):
             f"**{d['organization']}** · VAT {d['tax_number']}  \n"
             f":gray[{ENVIRONMENTS[d['env']]['label']} · {d['org_unit']}]"
         )
-        if active < 4:
+        if active < LAST_STEP:
             if right.button("Edit", type="tertiary", icon=":material/edit:",
                             help="Change your details. You'll need to redo the next steps."):
                 clear_progress()
@@ -826,51 +961,91 @@ with st.container(border=True, key=f"card-{state2}-2"):
         st.caption("Unlocks after you save your business details.")
 
 
-# ── STEP 3 · Activate ──────────────────────────────────────
+# ── STEP 3 · Test invoices ─────────────────────────────────
 
 state3 = step_state(3, active)
 with st.container(border=True, key=f"card-{state3}-3"):
     step_heading(
-        3, "Activate your certificate",
-        "Swap your trial certificate for the one you'll use to sign real invoices.",
+        3, "Send test invoices",
+        "ZATCA checks that your system can produce correct invoices before activating it.",
         state3,
     )
 
     if state3 == "current":
-        if s.details["env"] != "sandbox":
-            st.info(
-                "In Simulation and Live, ZATCA first expects your invoicing software to send a few "
-                "sample invoices (compliance checks). If activation fails for that reason, finish "
-                "those checks and press the button again.",
-                icon=":material/info:",
+        doc_count = len(invoice_signer.document_types_for(s.details["invoice_type"]))
+        if not s.compliance:
+            st.markdown(
+                f"We'll create **{doc_count} sample documents** (invoices, credit notes and debit "
+                f"notes) under your company name, sign them, and send them to ZATCA for checking. "
+                f"This is automatic and takes about a minute. These are test documents only: "
+                f"they don't count as real sales."
             )
-        if st.button("Activate my certificate", type="primary", width="stretch",
-                     icon=":material/rocket_launch:"):
+        else:
+            render_compliance_results(s.compliance["results"])
+
+        label = "Send test invoices" if not s.compliance else "Try again"
+        if st.button(label, type="primary", width="stretch", icon=":material/fact_check:"):
             s.error = None
-            with st.spinner("Activating with ZATCA..."):
-                pcsid, err, log = request_production_csid(s.details["env"], s.ccsid)
+            with st.spinner(f"Creating and sending {doc_count} test documents to ZATCA..."):
+                compliance, err, log = run_compliance_checks(
+                    s.details, s.ccsid, s.private_key_pem
+                )
             s.log[3] = log
+            s.compliance = compliance
             if err:
                 s.error = {"step": 3, "message": err, "log": log}
-            else:
-                s.pcsid = pcsid
             st.rerun()
 
         show_error(3)
 
     elif state3 == "done":
-        st.markdown(f"Activated. Your production certificate is ready "
-                    f":gray[(request {s.pcsid.get('requestID', '—')})].")
+        results = s.compliance["results"]
+        st.markdown(f"All {len(results)} test documents were accepted by ZATCA.")
+        with st.expander("See results"):
+            render_compliance_results(results)
 
     else:
         st.caption("Unlocks after ZATCA verifies your OTP.")
 
 
-# ── STEP 4 · Download ──────────────────────────────────────
+# ── STEP 4 · Activate ──────────────────────────────────────
 
-state4 = "current" if active == 4 else "locked"
+state4 = step_state(4, active)
 with st.container(border=True, key=f"card-{state4}-4"):
-    if active == 4:
+    step_heading(
+        4, "Activate your certificate",
+        "Swap your trial certificate for the one you'll use to sign real invoices.",
+        state4,
+    )
+
+    if state4 == "current":
+        if st.button("Activate my certificate", type="primary", width="stretch",
+                     icon=":material/rocket_launch:"):
+            s.error = None
+            with st.spinner("Activating with ZATCA..."):
+                pcsid, err, log = request_production_csid(s.details["env"], s.ccsid)
+            s.log[4] = log
+            if err:
+                s.error = {"step": 4, "message": err, "log": log}
+            else:
+                s.pcsid = pcsid
+            st.rerun()
+
+        show_error(4)
+
+    elif state4 == "done":
+        st.markdown(f"Activated. Your production certificate is ready "
+                    f":gray[(request {s.pcsid.get('requestID', '—')})].")
+
+    else:
+        st.caption("Unlocks after your test invoices pass.")
+
+
+# ── STEP 5 · Download ──────────────────────────────────────
+
+state5 = "current" if active == LAST_STEP else "locked"
+with st.container(border=True, key=f"card-{state5}-5"):
+    if active == LAST_STEP:
         d = s.details
         st.html(f"""
 <div class="success-panel">
@@ -914,7 +1089,7 @@ with st.container(border=True, key=f"card-{state4}-4"):
                 )
     else:
         step_heading(
-            4, "Download your settings",
+            5, "Download your settings",
             "Get the file your invoicing system needs to start signing invoices.",
             "locked",
         )
