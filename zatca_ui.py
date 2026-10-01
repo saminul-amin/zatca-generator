@@ -1,605 +1,303 @@
-import uuid
-import json
 import base64
-import hashlib
-import requests
+import html
+import json
+import os
+import re
 import subprocess
-import streamlit as st
+import tempfile
+import uuid
+from urllib.parse import quote
 from datetime import datetime, timezone
+
+import requests
+import streamlit as st
 
 # ═══════════════════════════════════════════════════════════
 # PAGE CONFIG
 # ═══════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="ZATCA E-Invoicing Integration",
-    page_icon="🇸🇦",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    page_title="ZATCA E-Invoicing Setup",
+    page_icon="🧾",
+    layout="centered",
+    initial_sidebar_state="collapsed",
 )
 
 # ═══════════════════════════════════════════════════════════
-# ENVIRONMENT URL MAPPING
+# CONSTANTS
 # ═══════════════════════════════════════════════════════════
 
-ENV_OPTIONS = {
-    "🧪 Sandbox (Developer Portal)": "https://gw-fatoora.zatca.gov.sa/e-invoicing/developer-portal",
-    "🔬 Simulation": "https://gw-fatoora.zatca.gov.sa/e-invoicing/simulation",
-    "🏭 Production": "https://gw-fatoora.zatca.gov.sa/e-invoicing/core",
+ENVIRONMENTS = {
+    "sandbox": {
+        "label": "Practice (Sandbox)",
+        "pill": "Practice mode",
+        "caption": "A safe trial run on ZATCA's developer portal. Nothing is real, "
+                   "and the sample details below work as they are.",
+        "url": "https://gw-fatoora.zatca.gov.sa/e-invoicing/developer-portal",
+        "template": "TSTZATCA-Code-Signing",
+    },
+    "simulation": {
+        "label": "Simulation",
+        "pill": "Simulation",
+        "caption": "A dress rehearsal on ZATCA's test platform, using your real business details.",
+        "url": "https://gw-fatoora.zatca.gov.sa/e-invoicing/simulation",
+        "template": "PREZATCA-Code-Signing",
+    },
+    "production": {
+        "label": "Live (Production)",
+        "pill": "Live",
+        "caption": "The real registration. Invoices signed with the result are official.",
+        "url": "https://gw-fatoora.zatca.gov.sa/e-invoicing/core",
+        "template": "ZATCA-Code-Signing",
+    },
 }
 
-ENV_BADGE_STYLES = {
-    "🧪 Sandbox (Developer Portal)": {
-        "label": "SANDBOX",
-        "bg": "linear-gradient(135deg, #c8a96e, #a07840)",
-        "color": "#0f1117",
-    },
-    "🔬 Simulation": {
-        "label": "SIMULATION",
-        "bg": "linear-gradient(135deg, #4a8fe7, #2d6bc4)",
-        "color": "#ffffff",
-    },
-    "🏭 Production": {
-        "label": "PRODUCTION",
-        "bg": "linear-gradient(135deg, #34c975, #1f8a50)",
-        "color": "#0f1117",
-    },
+SANDBOX_OTP = "123345"
+
+INVOICE_TYPES = {
+    "1100": "Both: business (B2B) & retail (B2C)",
+    "1000": "Business customers only (B2B)",
+    "0100": "Retail customers only (B2C)",
 }
 
+STEPS = ["Business details", "Verify with OTP", "Activate", "Download"]
+
+SAMPLE_VAT = "399999999900003"
+
 # ═══════════════════════════════════════════════════════════
-# CUSTOM CSS
+# STYLES
 # ═══════════════════════════════════════════════════════════
 
-st.markdown("""
+st.html("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+:root {
+    --brand: #0E7C4A;
+    --brand-dark: #0A5E38;
+    --brand-soft: #E7F3EC;
+    --ink: #13201A;
+    --muted: #5E6E66;
+    --line: #D9E2DC;
+    --card: #FFFFFF;
+}
 
-    /* --- Base & Background --- */
-    .stApp {
-        background-color: #0f1117;
-        color: #e8eaf0;
-        font-family: 'Inter', sans-serif;
-    }
+[data-testid="stMainBlockContainer"] {
+    max-width: 820px;
+    padding-top: 2.25rem;
+    padding-bottom: 4rem;
+}
+header[data-testid="stHeader"] { background: transparent; }
 
-    /* --- Sidebar --- */
-    [data-testid="stSidebar"] {
-        background: linear-gradient(160deg, #1a1f2e 0%, #12161f 100%);
-        border-right: 1px solid #2a2f3e;
-    }
-    [data-testid="stSidebar"] .stMarkdown h1,
-    [data-testid="stSidebar"] .stMarkdown h2,
-    [data-testid="stSidebar"] .stMarkdown h3 {
-        color: #c8a96e;
-    }
+/* ── Header ── */
+.app-header { display: flex; align-items: center; gap: 16px; }
+.app-logo {
+    width: 52px; height: 52px; border-radius: 14px; flex-shrink: 0;
+    background: linear-gradient(145deg, #13965C, #0A5E38);
+    display: grid; place-items: center;
+    box-shadow: 0 6px 16px rgba(14, 124, 74, .25);
+}
+.app-title {
+    font-size: 1.55rem; font-weight: 700; letter-spacing: -.02em;
+    color: var(--ink); line-height: 1.2;
+}
+.app-sub { color: var(--muted); font-size: .95rem; margin-top: 3px; }
+.env-pill {
+    margin-left: auto; padding: 6px 12px; border-radius: 999px;
+    font-size: .75rem; font-weight: 600; white-space: nowrap;
+}
+.env-sandbox    { background: #FFF4DB; color: #8A5A00; }
+.env-simulation { background: #E5EEFF; color: #1D4ED8; }
+.env-production { background: var(--brand-soft); color: var(--brand-dark); }
 
-    /* --- Main header --- */
-    .main-header {
-        background: linear-gradient(135deg, #1e2540 0%, #162032 50%, #1a2535 100%);
-        border: 1px solid #2e3a50;
-        border-radius: 14px;
-        padding: 28px 36px;
-        margin-bottom: 28px;
-        display: flex;
-        align-items: center;
-        gap: 18px;
-    }
-    .main-header h1 {
-        font-size: 2rem;
-        font-weight: 700;
-        color: #e8eaf0;
-        margin: 0;
-        letter-spacing: -0.5px;
-    }
-    .main-header p {
-        color: #8a94aa;
-        margin: 4px 0 0;
-        font-size: 0.95rem;
-    }
-    .zatca-badge {
-        padding: 5px 14px;
-        border-radius: 20px;
-        font-size: 0.72rem;
-        font-weight: 800;
-        letter-spacing: 1.2px;
-        white-space: nowrap;
-        display: inline-block;
-    }
+/* ── Progress stepper ── */
+.stepper { display: flex; align-items: flex-start; margin: 26px 0 6px; }
+.st-item {
+    flex: 1; display: flex; flex-direction: column; align-items: center;
+    position: relative; text-align: center;
+}
+.st-item:not(:last-child)::after {
+    content: ""; position: absolute; top: 17px; height: 2px;
+    left: calc(50% + 24px); right: calc(-50% + 24px);
+    background: var(--line);
+}
+.st-item.done:not(:last-child)::after { background: var(--brand); }
+.st-dot {
+    width: 36px; height: 36px; border-radius: 50%;
+    display: grid; place-items: center; z-index: 1;
+    font-weight: 600; font-size: .9rem;
+    background: #fff; border: 2px solid var(--line); color: var(--muted);
+}
+.st-item.done .st-dot { background: var(--brand); border-color: var(--brand); color: #fff; }
+.st-item.current .st-dot {
+    border-color: var(--brand); color: var(--brand);
+    box-shadow: 0 0 0 5px var(--brand-soft);
+}
+.st-label { margin-top: 8px; font-size: .8rem; font-weight: 500; color: var(--muted); }
+.st-item.current .st-label { color: var(--ink); font-weight: 600; }
 
-    /* --- Step Cards --- */
-    .step-card {
-        background: #161b27;
-        border: 1px solid #252b3b;
-        border-radius: 12px;
-        padding: 24px 28px;
-        margin-bottom: 20px;
-        transition: border-color 0.3s, box-shadow 0.3s;
-    }
-    .step-card:hover {
-        border-color: #3a4255;
-    }
-    .step-card-active {
-        border-color: #c8a96e !important;
-        background: linear-gradient(135deg, #1e1f16 0%, #161b27 100%) !important;
-        box-shadow: 0 0 20px rgba(200, 169, 110, 0.06);
-    }
-    .step-card-done {
-        border-color: #2a5c3f !important;
-        background: linear-gradient(135deg, #162a1e 0%, #161b27 100%) !important;
-    }
-    .step-card-error {
-        border-color: #5c2a2a !important;
-        background: linear-gradient(135deg, #2a1616 0%, #161b27 100%) !important;
-    }
+/* ── Step cards ── */
+[class*="st-key-card-"] { background: var(--card); border-radius: 14px !important; }
+[class*="st-key-card-current"] {
+    border-color: var(--brand) !important;
+    box-shadow: 0 10px 28px rgba(19, 32, 26, .07);
+}
+[class*="st-key-card-locked"] { background: transparent; }
+[class*="st-key-card-locked"] .step-title { color: var(--muted); }
 
-    /* --- Step header --- */
-    .step-header {
-        display: flex;
-        align-items: center;
-        gap: 14px;
-        margin-bottom: 16px;
-    }
-    .step-number {
-        width: 38px;
-        height: 38px;
-        border-radius: 50%;
-        background: #2a3045;
-        border: 2px solid #3d4560;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-weight: 700;
-        font-size: 1rem;
-        color: #8a94aa;
-        flex-shrink: 0;
-    }
-    .step-number-active {
-        background: #2e2818;
-        border-color: #c8a96e;
-        color: #e8c96e;
-        animation: pulseGold 2.5s ease-in-out infinite;
-    }
-    @keyframes pulseGold {
-        0%, 100% { box-shadow: 0 0 0 0 rgba(200, 169, 110, 0.25); }
-        50% { box-shadow: 0 0 12px 3px rgba(200, 169, 110, 0.15); }
-    }
-    .step-number-done {
-        background: #1a4030;
-        border-color: #2e7a55;
-        color: #4ec98a;
-    }
-    .step-title {
-        font-size: 1.1rem;
-        font-weight: 600;
-        color: #c8cfe0;
-    }
-    .step-subtitle {
-        font-size: 0.82rem;
-        color: #5a6478;
-        margin-top: 2px;
-    }
+.step-head { display: flex; align-items: center; gap: 12px; }
+.step-num {
+    width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0;
+    display: grid; place-items: center; font-weight: 600; font-size: .85rem;
+    background: #EEF1EF; color: var(--muted);
+}
+.step-num.current { background: var(--brand); color: #fff; }
+.step-num.done { background: var(--brand-soft); color: var(--brand); }
+.step-title { font-weight: 650; font-size: 1.06rem; color: var(--ink); line-height: 1.3; }
+.step-desc { color: var(--muted); font-size: .88rem; margin-top: 1px; }
+.step-tag {
+    margin-left: auto; font-size: .72rem; font-weight: 600;
+    padding: 4px 10px; border-radius: 999px; white-space: nowrap;
+}
+.tag-done    { background: var(--brand-soft); color: var(--brand-dark); }
+.tag-current { background: #FFF4DB; color: #8A5A00; }
+.tag-locked  { background: #EEF1EF; color: #7A8981; }
 
-    /* --- Status badges --- */
-    .badge {
-        display: inline-block;
-        padding: 3px 10px;
-        border-radius: 12px;
-        font-size: 0.75rem;
-        font-weight: 600;
-        letter-spacing: 0.5px;
-    }
-    .badge-pending  { background: #2a2f3e; color: #6a748a; }
-    .badge-running  { background: #2e2818; color: #e8c96e; }
-    .badge-success  { background: #1a3a28; color: #4ec98a; }
-    .badge-error    { background: #3a1a1a; color: #e06060; }
+.section-label {
+    font-size: .74rem; font-weight: 700; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--muted); margin: 6px 0 -4px;
+}
 
-    /* --- Result boxes --- */
-    .result-box {
-        background: #0d1018;
-        border: 1px solid #222736;
-        border-radius: 8px;
-        padding: 16px 18px;
-        font-family: 'Courier New', monospace;
-        font-size: 0.82rem;
-        color: #7aff9a;
-        white-space: pre-wrap;
-        word-break: break-all;
-        max-height: 260px;
-        overflow-y: auto;
-        margin-top: 12px;
-    }
-    .result-box-error {
-        color: #ff7a7a;
-        border-color: #3a2020;
-    }
+/* ── How-to list ── */
+.howto {
+    background: #F7FAF8; border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 18px 14px 16px; font-size: .9rem; color: var(--ink);
+}
+.howto ol { margin: 6px 0 0; padding-left: 20px; }
+.howto li { margin: 4px 0; }
+.howto a { color: var(--brand); font-weight: 600; }
 
-    /* --- Info grid --- */
-    .info-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-        gap: 12px;
-        margin-top: 14px;
-    }
-    .info-item {
-        background: #0d1018;
-        border: 1px solid #1e2330;
-        border-radius: 8px;
-        padding: 12px 14px;
-    }
-    .info-label {
-        font-size: 0.72rem;
-        color: #5a6478;
-        text-transform: uppercase;
-        letter-spacing: 0.8px;
-        margin-bottom: 4px;
-    }
-    .info-value {
-        font-size: 0.88rem;
-        color: #c8cfe0;
-        font-weight: 500;
-        word-break: break-all;
-    }
+/* ── Success panel ── */
+.success-panel {
+    text-align: center; padding: 22px 18px 8px;
+}
+.success-icon {
+    width: 64px; height: 64px; border-radius: 50%; margin: 0 auto 14px;
+    background: var(--brand-soft); color: var(--brand);
+    display: grid; place-items: center;
+}
+.success-title { font-size: 1.35rem; font-weight: 700; color: var(--ink); }
+.success-text { color: var(--muted); font-size: .95rem; margin-top: 6px; }
 
-    /* --- Divider --- */
-    .section-divider {
-        border: none;
-        border-top: 1px solid #1e2330;
-        margin: 20px 0;
-    }
+/* ── Footer ── */
+.app-footer {
+    margin-top: 34px; padding-top: 14px; border-top: 1px solid var(--line);
+    text-align: center; color: #8A9891; font-size: .78rem;
+}
 
-    /* ============================================ */
-    /* PRIMARY ACTION BUTTONS — High-Contrast Gold  */
-    /* ============================================ */
-    .stButton > button {
-        background: linear-gradient(135deg, #d4b36a 0%, #c8a96e 40%, #b8944a 100%) !important;
-        color: #1a1400 !important;
-        border: 1px solid #c8a96e !important;
-        border-radius: 10px !important;
-        padding: 12px 28px !important;
-        font-weight: 700 !important;
-        font-size: 0.92rem !important;
-        letter-spacing: 0.3px !important;
-        transition: all 0.25s ease !important;
-        cursor: pointer !important;
-        box-shadow: 0 2px 8px rgba(200, 169, 110, 0.18) !important;
-        text-shadow: 0 1px 0 rgba(255,255,255,0.15) !important;
-    }
-    .stButton > button:hover {
-        background: linear-gradient(135deg, #e0c278 0%, #d4b36a 40%, #c8a96e 100%) !important;
-        border-color: #e0c278 !important;
-        box-shadow: 0 4px 16px rgba(200, 169, 110, 0.3) !important;
-        transform: translateY(-2px) !important;
-        color: #0f0a00 !important;
-    }
-    .stButton > button:active {
-        transform: translateY(0) !important;
-        box-shadow: 0 1px 4px rgba(200, 169, 110, 0.15) !important;
-    }
-    .stButton > button:focus {
-        outline: 2px solid #e0c278 !important;
-        outline-offset: 2px !important;
-    }
+.env-pill-inline { display: none; }
 
-    /* ============================================ */
-    /* DOWNLOAD BUTTONS — Teal / Emerald accent     */
-    /* ============================================ */
-    .stDownloadButton > button {
-        background: linear-gradient(135deg, #1a4a3a 0%, #1e5c48 50%, #1a4a3a 100%) !important;
-        color: #5aeaa0 !important;
-        border: 1px solid #2e7a55 !important;
-        border-radius: 10px !important;
-        padding: 10px 22px !important;
-        font-weight: 600 !important;
-        font-size: 0.88rem !important;
-        transition: all 0.25s ease !important;
-        cursor: pointer !important;
-        box-shadow: 0 2px 6px rgba(46, 122, 85, 0.12) !important;
-    }
-    .stDownloadButton > button:hover {
-        background: linear-gradient(135deg, #1e5c48 0%, #24725a 50%, #1e5c48 100%) !important;
-        border-color: #3ea875 !important;
-        box-shadow: 0 4px 14px rgba(46, 122, 85, 0.25) !important;
-        transform: translateY(-1px) !important;
-        color: #7affc0 !important;
-    }
-    .stDownloadButton > button:active {
-        transform: translateY(0) !important;
-    }
-    .stDownloadButton > button:focus {
-        outline: 2px solid #3ea875 !important;
-        outline-offset: 2px !important;
-    }
-
-    /* ============================================ */
-    /* RESET BUTTON — Red outline in sidebar        */
-    /* ============================================ */
-    [data-testid="stSidebar"] .stButton > button[kind="secondary"],
-    [data-testid="stSidebar"] .reset-btn-container .stButton > button {
-        background: transparent !important;
-        color: #e06060 !important;
-        border: 1.5px solid #5c2a2a !important;
-        font-weight: 600 !important;
-        box-shadow: none !important;
-        text-shadow: none !important;
-    }
-    [data-testid="stSidebar"] .stButton > button[kind="secondary"]:hover,
-    [data-testid="stSidebar"] .reset-btn-container .stButton > button:hover {
-        background: rgba(224, 96, 96, 0.08) !important;
-        border-color: #e06060 !important;
-        box-shadow: 0 0 12px rgba(224, 96, 96, 0.1) !important;
-        color: #ff7a7a !important;
-        transform: translateY(-1px) !important;
-    }
-
-    /* --- Input fields --- */
-    div[data-testid="stTextInput"] input,
-    div[data-testid="stTextArea"] textarea,
-    div[data-testid="stSelectbox"] > div > div {
-        background: #0d1018 !important;
-        border: 1px solid #252b3b !important;
-        color: #e8eaf0 !important;
-        border-radius: 8px !important;
-    }
-    div[data-testid="stTextInput"] input:focus,
-    div[data-testid="stTextArea"] textarea:focus {
-        border-color: #c8a96e !important;
-        box-shadow: 0 0 0 1px rgba(200, 169, 110, 0.2) !important;
-    }
-    label[data-testid="stWidgetLabel"] p {
-        color: #8a94aa !important;
-        font-size: 0.85rem !important;
-    }
-    .stAlert {
-        border-radius: 8px !important;
-    }
-    .stExpander {
-        border: 1px solid #252b3b !important;
-        border-radius: 8px !important;
-        background: #161b27 !important;
-    }
-    div[data-testid="stExpander"] summary {
-        color: #8a94aa !important;
-    }
-    div[data-testid="stExpander"] summary:hover {
-        color: #c8a96e !important;
-    }
-
-    /* Progress pipeline */
-    .pipeline {
-        display: flex;
-        align-items: center;
-        gap: 0;
-        margin: 20px 0 28px;
-    }
-    .pipe-step {
-        flex: 1;
-        text-align: center;
-        padding: 10px 6px;
-        background: #161b27;
-        border: 1px solid #252b3b;
-        font-size: 0.78rem;
-        color: #5a6478;
-        font-weight: 600;
-        position: relative;
-        transition: all 0.3s ease;
-    }
-    .pipe-step:first-child { border-radius: 8px 0 0 8px; }
-    .pipe-step:last-child  { border-radius: 0 8px 8px 0; }
-    .pipe-step-active {
-        background: #2e2818;
-        border-color: #c8a96e;
-        color: #e8c96e;
-    }
-    .pipe-step-done {
-        background: #1a3a28;
-        border-color: #2e7a55;
-        color: #4ec98a;
-    }
-
-    /* --- Env URL display --- */
-    .env-url-display {
-        background: #0d1018;
-        border: 1px solid #1e2330;
-        border-radius: 6px;
-        padding: 8px 12px;
-        font-family: 'Courier New', monospace;
-        font-size: 0.72rem;
-        color: #5a8a6a;
-        word-break: break-all;
-        margin-top: 6px;
-    }
-
-    /* --- Sidebar section label --- */
-    .sidebar-section-label {
-        font-size: 0.7rem;
-        font-weight: 700;
-        color: #4a5268;
-        text-transform: uppercase;
-        letter-spacing: 1.2px;
-        margin: 18px 0 8px;
-    }
-
-    /* Scrollbar */
-    ::-webkit-scrollbar { width: 6px; }
-    ::-webkit-scrollbar-track { background: #0d1018; }
-    ::-webkit-scrollbar-thumb { background: #3a4255; border-radius: 3px; }
-    ::-webkit-scrollbar-thumb:hover { background: #4a5268; }
+@media (max-width: 640px) {
+    [data-testid="stMainBlockContainer"] { padding-top: 1.25rem; }
+    .app-header { align-items: flex-start; gap: 12px; }
+    .app-logo { width: 44px; height: 44px; border-radius: 12px; }
+    .app-title { font-size: 1.2rem; }
+    .app-sub { font-size: .85rem; }
+    .env-pill { display: none; }
+    .env-pill-inline { display: inline-block; margin: 8px 0 0; padding: 4px 10px; }
+    .stepper { margin-top: 20px; }
+    .st-label { font-size: .68rem; line-height: 1.25; max-width: 64px; }
+    .step-tag { display: none; }
+    .step-head { align-items: flex-start; }
+}
 </style>
-""", unsafe_allow_html=True)
+""")
 
+ICONS = {
+    "check": '<polyline points="20 6 9 17 4 12"/>',
+    "receipt": '<path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1Z"/>'
+               '<path d="M8 8h8"/><path d="M8 12h8"/><path d="M8 16h5"/>',
+}
+
+
+def _icon_css():
+    rules = [
+        ".ico { display: inline-block; width: 16px; height: 16px; background-color: currentColor;"
+        " -webkit-mask: var(--ico) center / contain no-repeat; mask: var(--ico) center / contain no-repeat; }",
+        ".ico-lg { width: 32px; height: 32px; }",
+        ".app-logo .ico { width: 26px; height: 26px; background-color: #fff; }",
+    ]
+    for name, body in ICONS.items():
+        svg = ("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' "
+               "stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'>" + body + "</svg>")
+        rules.append(f'.ico-{name} {{ --ico: url("data:image/svg+xml,{quote(svg)}"); }}')
+    return "<style>" + "\n".join(rules) + "</style>"
+
+
+st.html(_icon_css())
 
 # ═══════════════════════════════════════════════════════════
-# SESSION STATE INIT
+# SESSION STATE
 # ═══════════════════════════════════════════════════════════
 
-defaults = {
-    "step1_done": False,
-    "step2_done": False,
-    "step3_done": False,
+
+def default_form():
+    return {
+        "env": "sandbox",
+        "organization": "Maximum Speed Tech Supply LTD",
+        "org_unit": "Riyadh Branch",
+        "tax_number": SAMPLE_VAT,
+        "common_name": "TST-886431145-399999999900003",
+        "address": "RRRD2929",
+        "business_cat": "Supply activities",
+        "invoice_type": "1100",
+        "country": "SA",
+        "serial_number": f"1-TST|2-TST|3-{uuid.uuid4()}",
+    }
+
+
+PROGRESS_KEYS = {
+    "details": None,          # saved business details (step 1)
     "private_key_pem": None,
-    "csr_base64": None,
     "csr_pem": None,
-    "ccsid_data": None,
-    "pcsid_data": None,
-    "step1_log": "",
-    "step2_log": "",
-    "step3_log": "",
-    "step1_error": False,
-    "step2_error": False,
-    "step3_error": False,
-    "default_serial_number": f"1-TST|2-TST|3-{uuid.uuid4()}",
-}
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-
-# ═══════════════════════════════════════════════════════════
-# SIDEBAR — CONFIGURATION
-# ═══════════════════════════════════════════════════════════
-
-with st.sidebar:
-    st.markdown("## ⚙️ Configuration")
-    st.markdown("<hr style='border-color:#2a2f3e;margin:8px 0 18px'>", unsafe_allow_html=True)
-
-    # ── Environment Selector ──
-    st.markdown('<div class="sidebar-section-label">Environment</div>', unsafe_allow_html=True)
-    selected_env = st.selectbox(
-        "Select Environment",
-        options=list(ENV_OPTIONS.keys()),
-        index=0,
-        label_visibility="collapsed",
-    )
-    env_url = ENV_OPTIONS[selected_env]
-    st.markdown(f'<div class="env-url-display">🔗 {env_url}</div>', unsafe_allow_html=True)
-
-    st.markdown("<hr style='border-color:#2a2f3e;margin:14px 0 10px'>", unsafe_allow_html=True)
-
-    # ── OTP ──
-    st.markdown('<div class="sidebar-section-label">Authentication</div>', unsafe_allow_html=True)
-    otp = st.text_input("OTP (One-Time Password)", value="123345", type="password")
-
-    st.markdown("<hr style='border-color:#2a2f3e;margin:14px 0 10px'>", unsafe_allow_html=True)
-
-    # ── CSR Configuration (expandable) ──
-    with st.expander("🔧 Configure CSR Parameters", expanded=False):
-        tax_number  = st.text_input("Tax Number (UID)", value="399999999900003")
-        common_name = st.text_input("Common Name (CN)", value=f"TST-886431145-399999999900003",
-                                     help="e.g. TST-886431145-{TaxNumber}")
-        serial_number = st.text_input("Serial Number (SN)", value=st.session_state.default_serial_number,
-                                       help="Format: 1-CompanyName|2-Version|3-UUID")
-        org_name    = st.text_input("Organization Name (O)", value="Maximum Speed Tech Supply LTD")
-        org_unit    = st.text_input("Organization Unit (OU)", value="Riyadh Branch")
-        country     = st.text_input("Country Code (C)", value="SA", max_chars=2)
-        address     = st.text_input("Registered Address", value="RRRD2929")
-        biz_cat     = st.text_input("Business Category", value="Supply activities")
-        invoice_tp  = st.selectbox("Invoice Type Code (TITLE)", ["1100", "0100", "1000", "0000"])
-
-    st.markdown("<hr style='border-color:#2a2f3e;margin:14px 0 10px'>", unsafe_allow_html=True)
-
-    # ── Session Files ──
-    st.markdown("### 📂 Session Files")
-
-    if st.session_state.step1_done:
-        st.success("🔑 private_key.pem  ✓")
-        st.success("📄 csr.pem  ✓")
-    if st.session_state.step2_done:
-        st.success("🔐 ccsid.json  ✓")
-    if st.session_state.step3_done:
-        st.success("🏭 pcsid.json  ✓")
-
-    if not any([st.session_state.step1_done, st.session_state.step2_done, st.session_state.step3_done]):
-        st.caption("No files generated yet.")
-
-    st.markdown("<hr style='border-color:#2a2f3e;margin:18px 0 12px'>", unsafe_allow_html=True)
-
-    # ── Reset Button ──
-    st.markdown('<div class="reset-btn-container">', unsafe_allow_html=True)
-    if st.button("🔄 Reset All Steps", use_container_width=True, type="secondary"):
-        for k in defaults:
-            st.session_state[k] = defaults[k]
-        st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-# ═══════════════════════════════════════════════════════════
-# BUILD CONFIG FROM SIDEBAR
-# ═══════════════════════════════════════════════════════════
-
-CONFIG = {
-    "common_name":   common_name,
-    "country":       country,
-    "org_unit":      org_unit,
-    "organization":  org_name,
-    "serial_number": serial_number,
-    "tax_number":    tax_number,
-    "invoice_type":  invoice_tp,
-    "address":       address,
-    "business_cat":  biz_cat,
+    "csr_base64": None,
+    "ccsid": None,            # compliance certificate (step 2)
+    "pcsid": None,            # production certificate (step 3)
+    "error": None,            # {"step": n, "message": str, "log": str}
+    "log": {},                # technical log per step
 }
 
-
-# ═══════════════════════════════════════════════════════════
-# MAIN HEADER
-# ═══════════════════════════════════════════════════════════
-
-badge_info = ENV_BADGE_STYLES[selected_env]
-st.markdown(f"""
-<div class="main-header">
-    <div style="font-size:2.6rem">🇸🇦</div>
-    <div>
-        <div style="display:flex;align-items:center;gap:12px;margin-bottom:4px">
-            <h1 style="font-size:1.7rem;font-weight:700;color:#e8eaf0;margin:0">
-                ZATCA E-Invoicing Integration
-            </h1>
-            <span class="zatca-badge" style="background:{badge_info['bg']};color:{badge_info['color']}">
-                {badge_info['label']}
-            </span>
-        </div>
-        <p style="color:#5a6478;margin:0;font-size:0.88rem">
-            Fatoora Platform · {badge_info['label'].title()} Environment · UBL 2.1 · Saudi Arabia VAT
-        </p>
-    </div>
-</div>
-""", unsafe_allow_html=True)
+if "form" not in st.session_state:
+    st.session_state.form = default_form()
+if "otp" not in st.session_state:
+    st.session_state.otp = SANDBOX_OTP
+for _k, _v in PROGRESS_KEYS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = dict(_v) if isinstance(_v, dict) else _v
 
 
-# ═══════════════════════════════════════════════════════════
-# PIPELINE PROGRESS BAR
-# ═══════════════════════════════════════════════════════════
+def clear_progress():
+    for k, v in PROGRESS_KEYS.items():
+        st.session_state[k] = dict(v) if isinstance(v, dict) else v
 
-def pipe_class(step_done, step_active):
-    if step_done:   return "pipe-step pipe-step-done"
-    if step_active: return "pipe-step pipe-step-active"
-    return "pipe-step"
 
-s1_active = not st.session_state.step1_done
-s2_active = st.session_state.step1_done and not st.session_state.step2_done
-s3_active = st.session_state.step2_done and not st.session_state.step3_done
-
-st.markdown(f"""
-<div class="pipeline">
-    <div class="{pipe_class(st.session_state.step1_done, s1_active)}">
-        {"✅" if st.session_state.step1_done else ("🟡" if s1_active else "○")}
-        <br>Step 1<br><small>CSR Generation</small>
-    </div>
-    <div class="{pipe_class(st.session_state.step2_done, s2_active)}">
-        {"✅" if st.session_state.step2_done else ("🟡" if s2_active else "○")}
-        <br>Step 2<br><small>Compliance CSID</small>
-    </div>
-    <div class="{pipe_class(st.session_state.step3_done, s3_active)}">
-        {"✅" if st.session_state.step3_done else ("🟡" if s3_active else "○")}
-        <br>Step 3<br><small>Production CSID</small>
-    </div>
-</div>
-""", unsafe_allow_html=True)
+def current_step():
+    s = st.session_state
+    if s.details is None:
+        return 1
+    if s.ccsid is None:
+        return 2
+    if s.pcsid is None:
+        return 3
+    return 4
 
 
 # ═══════════════════════════════════════════════════════════
-# BACKEND FUNCTIONS
+# BACKEND
 # ═══════════════════════════════════════════════════════════
 
-def run_step1():
-    logs = []
+
+def generate_key_and_csr(details):
+    """Create an EC private key and CSR with OpenSSL in a private temp folder."""
+    template = ENVIRONMENTS[details["env"]]["template"]
     config_content = f"""oid_section = OIDs
 [OIDs]
 certificateTemplateName = 1.3.6.1.4.1.311.20.2
@@ -612,455 +310,195 @@ req_extensions = req_ext
 distinguished_name = dn
 
 [dn]
-CN = {CONFIG['common_name']}
-OU = {CONFIG['org_unit']}
-O  = {CONFIG['organization']}
-C  = {CONFIG['country']}
+CN = {details['common_name']}
+OU = {details['org_unit']}
+O  = {details['organization']}
+C  = {details['country']}
 
 [req_ext]
-certificateTemplateName = ASN1:PRINTABLESTRING:TSTZATCA-Code-Signing
+certificateTemplateName = ASN1:PRINTABLESTRING:{template}
 subjectAltName = dirName:alt_names
 
 [alt_names]
-SN = {CONFIG['serial_number']}
-UID = {CONFIG['tax_number']}
-title = {CONFIG['invoice_type']}
-registeredAddress = {CONFIG['address']}
-businessCategory = {CONFIG['business_cat']}
+SN = {details['serial_number']}
+UID = {details['tax_number']}
+title = {details['invoice_type']}
+registeredAddress = {details['address']}
+businessCategory = {details['business_cat']}
 """
-    with open("zatca_csr.cnf", "w") as f:
-        f.write(config_content)
-    logs.append("📝 CSR config file written → zatca_csr.cnf")
-
-    r1 = subprocess.run(
-        ["openssl", "ecparam", "-name", "secp256k1", "-genkey", "-noout", "-out", "private_key.pem"],
-        capture_output=True, text=True
-    )
-    if r1.returncode != 0:
-        return None, None, None, "\n".join(logs) + f"\n❌ Key generation failed:\n{r1.stderr}", True
-
-    logs.append("🔑 EC private key generated  →  private_key.pem")
-
-    r2 = subprocess.run(
-        ["openssl", "req", "-new", "-sha256",
-         "-key", "private_key.pem",
-         "-config", "zatca_csr.cnf",
-         "-out", "csr.pem"],
-        capture_output=True, text=True
-    )
-    if r2.returncode != 0:
-        return None, None, None, "\n".join(logs) + f"\n❌ CSR generation failed:\n{r2.stderr}", True
-
-    logs.append("📄 CSR generated  →  csr.pem")
-
-    with open("csr.pem", "r") as f:
-        csr_pem = f.read()
-    csr_b64 = base64.b64encode(csr_pem.encode("utf-8")).decode("utf-8")
-
-    with open("csr.txt", "w") as f:
-        f.write(csr_b64)
-
-    with open("private_key.pem", "r") as f:
-        pk_pem = f.read()
-
-    logs.append("📦 CSR base64 encoded  →  csr.txt")
-    logs.append(f"\n✅ Success!")
-    logs.append(f"   Common Name   : {CONFIG['common_name']}")
-    logs.append(f"   Serial Number : {CONFIG['serial_number']}")
-    logs.append(f"   Tax Number    : {CONFIG['tax_number']}")
-
-    return pk_pem, csr_b64, csr_pem, "\n".join(logs), False
-
-
-def run_step2(csr_b64):
     logs = []
-    url = f"{env_url}/compliance"
+    with tempfile.TemporaryDirectory() as tmp:
+        cnf_path = os.path.join(tmp, "zatca_csr.cnf")
+        key_path = os.path.join(tmp, "private_key.pem")
+        csr_path = os.path.join(tmp, "csr.pem")
+        with open(cnf_path, "w") as f:
+            f.write(config_content)
+        logs.append(f"CSR config written (template: {template})")
+
+        try:
+            r1 = subprocess.run(
+                ["openssl", "ecparam", "-name", "secp256k1", "-genkey", "-noout", "-out", key_path],
+                capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            return None, "OpenSSL is not installed on this server.", "\n".join(logs)
+        if r1.returncode != 0:
+            logs.append(f"Key generation failed:\n{r1.stderr}")
+            return None, "Could not create your security key.", "\n".join(logs)
+        logs.append("EC secp256k1 private key generated")
+
+        r2 = subprocess.run(
+            ["openssl", "req", "-new", "-sha256", "-key", key_path, "-config", cnf_path, "-out", csr_path],
+            capture_output=True, text=True,
+        )
+        if r2.returncode != 0:
+            logs.append(f"CSR generation failed:\n{r2.stderr}")
+            return None, ("Could not create the certificate request. "
+                          "Check your business details for unusual characters."), "\n".join(logs)
+        logs.append("Certificate Signing Request (CSR) generated")
+
+        with open(key_path) as f:
+            private_key_pem = f.read()
+        with open(csr_path) as f:
+            csr_pem = f.read()
+
+    result = {
+        "private_key_pem": private_key_pem,
+        "csr_pem": csr_pem,
+        "csr_base64": base64.b64encode(csr_pem.encode("utf-8")).decode("utf-8"),
+    }
+    return result, None, "\n".join(logs)
+
+
+def _zatca_messages(data):
+    msgs = []
+    if isinstance(data, dict):
+        for k in ("message", "errorMessage", "error", "Message"):
+            if isinstance(data.get(k), str):
+                msgs.append(data[k])
+        for k in ("errors", "validationResults"):
+            items = data.get(k)
+            if isinstance(items, dict):
+                items = items.get("errorMessages") or []
+            if isinstance(items, list):
+                for e in items:
+                    if isinstance(e, str):
+                        msgs.append(e)
+                    elif isinstance(e, dict):
+                        msgs.append(e.get("message") or e.get("code") or json.dumps(e))
+    return [m for m in msgs if m]
+
+
+def explain_failure(step, status, body_text):
+    """Turn a ZATCA error response into plain language."""
+    try:
+        data = json.loads(body_text)
+    except ValueError:
+        data = None
+    msgs = _zatca_messages(data)
+    lower = body_text.lower()
+
+    if step == 2 and "otp" in lower:
+        return ("ZATCA did not accept the one-time password (OTP). It may be mistyped, "
+                "already used, or expired (codes last 1 hour). Get a new code and try again.")
+    if step == 3 and "compliance" in lower:
+        return ("ZATCA says the compliance checks aren't finished yet. Your invoicing software "
+                "must send ZATCA's sample invoices first; then come back and activate again.")
+    if status in (401, 403):
+        return "ZATCA refused the request because it couldn't confirm who you are."
+    if status >= 500:
+        return "ZATCA's servers had a problem on their side. Please wait a few minutes and try again."
+    if msgs:
+        return "ZATCA did not accept the request: " + "; ".join(msgs[:3])
+    return f"ZATCA did not accept the request (error {status})."
+
+
+def call_zatca(step, url, headers, body):
+    logs = [f"POST {url}"]
+    try:
+        resp = requests.post(url, json=body, headers=headers, timeout=30)
+    except requests.RequestException as e:
+        logs.append(f"Network error: {e}")
+        return None, "Could not reach ZATCA. Check your internet connection and try again.", "\n".join(logs)
+
+    logs.append(f"HTTP {resp.status_code}")
+    if resp.status_code in (200, 201):
+        try:
+            data = resp.json()
+        except ValueError:
+            logs.append(f"Response: {resp.text[:600]}")
+            return None, "ZATCA sent back an unexpected reply. Please try again.", "\n".join(logs)
+        result = {
+            "binarySecurityToken": data.get("binarySecurityToken"),
+            "secret": data.get("secret"),
+            "requestID": data.get("requestID"),
+        }
+        logs.append(f"requestID: {result['requestID']}")
+        return result, None, "\n".join(logs)
+
+    logs.append(f"Response: {resp.text[:600]}")
+    return None, explain_failure(step, resp.status_code, resp.text), "\n".join(logs)
+
+
+def request_compliance_csid(env, csr_base64, otp):
     headers = {
-        "accept":          "application/json",
+        "accept": "application/json",
         "accept-language": "en",
-        "Accept-Version":  "V2",
-        "Content-Type":    "application/json",
-        "OTP":             otp,
+        "Accept-Version": "V2",
+        "Content-Type": "application/json",
+        "OTP": otp,
     }
-    body = {"csr": csr_b64}
-    logs.append(f"🌐 POST  {url}")
-    logs.append(f"   OTP : {otp}")
-
-    try:
-        response = requests.post(url, json=body, headers=headers, timeout=30)
-    except requests.RequestException as e:
-        return None, "\n".join(logs) + f"\n❌ Network error: {e}", True
-
-    logs.append(f"   HTTP Status : {response.status_code}")
-
-    if response.status_code in [200, 201]:
-        data = response.json()
-        ccsid = {
-            "binarySecurityToken": data.get("binarySecurityToken"),
-            "secret":              data.get("secret"),
-            "requestID":           data.get("requestID"),
-        }
-        with open("ccsid.json", "w") as f:
-            json.dump(ccsid, f, indent=4)
-        logs.append(f"\n✅ Compliance CSID received  →  ccsid.json")
-        logs.append(f"   requestID : {ccsid['requestID']}")
-        logs.append(f"   Token     : {str(ccsid['binarySecurityToken'])[:60]}...")
-        return ccsid, "\n".join(logs), False
-    else:
-        logs.append(f"\n❌ Request failed")
-        logs.append(f"   Response : {response.text[:600]}")
-        return None, "\n".join(logs), True
+    return call_zatca(2, f"{ENVIRONMENTS[env]['url']}/compliance", headers, {"csr": csr_base64})
 
 
-def run_step3(ccsid_data):
-    logs = []
-    token       = ccsid_data["binarySecurityToken"]
-    secret      = ccsid_data["secret"]
-    credentials = base64.b64encode(f"{token}:{secret}".encode()).decode()
-    url         = f"{env_url}/production/csids"
-    headers     = {
-        "accept":          "application/json",
+def request_production_csid(env, ccsid):
+    credentials = base64.b64encode(
+        f"{ccsid['binarySecurityToken']}:{ccsid['secret']}".encode()
+    ).decode()
+    headers = {
+        "accept": "application/json",
         "accept-language": "en",
-        "Accept-Version":  "V2",
-        "Content-Type":    "application/json",
-        "Authorization":   f"Basic {credentials}",
+        "Accept-Version": "V2",
+        "Content-Type": "application/json",
+        "Authorization": f"Basic {credentials}",
     }
-    body = {"compliance_request_id": str(ccsid_data["requestID"])}
-    logs.append(f"🌐 POST  {url}")
-    logs.append(f"   Compliance Request ID : {ccsid_data['requestID']}")
-
-    try:
-        response = requests.post(url, json=body, headers=headers, timeout=30)
-    except requests.RequestException as e:
-        return None, "\n".join(logs) + f"\n❌ Network error: {e}", True
-
-    logs.append(f"   HTTP Status : {response.status_code}")
-
-    if response.status_code in [200, 201]:
-        data = response.json()
-        pcsid = {
-            "binarySecurityToken": data.get("binarySecurityToken"),
-            "secret":              data.get("secret"),
-            "requestID":           data.get("requestID"),
-        }
-        with open("pcsid.json", "w") as f:
-            json.dump(pcsid, f, indent=4)
-        logs.append(f"\n✅ Production CSID received  →  pcsid.json")
-        logs.append(f"   requestID : {pcsid['requestID']}")
-        logs.append(f"   Token     : {str(pcsid['binarySecurityToken'])[:60]}...")
-        return pcsid, "\n".join(logs), False
-    else:
-        logs.append(f"\n❌ Request failed")
-        logs.append(f"   Response : {response.text[:600]}")
-        return None, "\n".join(logs), True
+    body = {"compliance_request_id": str(ccsid["requestID"])}
+    return call_zatca(3, f"{ENVIRONMENTS[env]['url']}/production/csids", headers, body)
 
 
-# ═══════════════════════════════════════════════════════════
-# STEP 1 — Generate Private Key + CSR
-# ═══════════════════════════════════════════════════════════
-
-step1_card_cls = (
-    "step-card step-card-done"  if st.session_state.step1_done and not st.session_state.step1_error else
-    "step-card step-card-error" if st.session_state.step1_error else
-    "step-card step-card-active"
-)
-
-st.markdown(f'<div class="{step1_card_cls}">', unsafe_allow_html=True)
-
-num_cls1 = "step-number step-number-done" if st.session_state.step1_done else "step-number step-number-active"
-badge1 = (
-    '<span class="badge badge-success">✓ Complete</span>' if st.session_state.step1_done else
-    '<span class="badge badge-error">✗ Error</span>'     if st.session_state.step1_error else
-    '<span class="badge badge-running">● Active</span>'
-)
-
-st.markdown(f"""
-<div class="step-header">
-    <div class="{num_cls1}">1</div>
-    <div>
-        <div class="step-title">Generate Private Key &amp; CSR</div>
-        <div class="step-subtitle">Creates EC secp256k1 private key and Certificate Signing Request</div>
-    </div>
-    <div style="margin-left:auto">{badge1}</div>
-</div>
-""", unsafe_allow_html=True)
-
-if not st.session_state.step1_done:
-    with st.expander("📋 Configuration Preview", expanded=False):
-        st.markdown(f"""
-<div class="info-grid">
-    <div class="info-item"><div class="info-label">Common Name (CN)</div><div class="info-value">{CONFIG['common_name']}</div></div>
-    <div class="info-item"><div class="info-label">Serial Number (SN)</div><div class="info-value">{CONFIG['serial_number']}</div></div>
-    <div class="info-item"><div class="info-label">Organization (O)</div><div class="info-value">{CONFIG['organization']}</div></div>
-    <div class="info-item"><div class="info-label">Org Unit (OU)</div><div class="info-value">{CONFIG['org_unit']}</div></div>
-    <div class="info-item"><div class="info-label">Country (C)</div><div class="info-value">{CONFIG['country']}</div></div>
-    <div class="info-item"><div class="info-label">Tax Number (UID)</div><div class="info-value">{CONFIG['tax_number']}</div></div>
-    <div class="info-item"><div class="info-label">Invoice Type (TITLE)</div><div class="info-value">{CONFIG['invoice_type']}</div></div>
-    <div class="info-item"><div class="info-label">Address</div><div class="info-value">{CONFIG['address']}</div></div>
-    <div class="info-item"><div class="info-label">Business Category</div><div class="info-value">{CONFIG['business_cat']}</div></div>
-</div>
-""", unsafe_allow_html=True)
-
-    if st.button("🚀 Generate CSR & Private Key", key="btn_step1", use_container_width=True):
-        with st.spinner("Generating EC key and CSR via OpenSSL..."):
-            pk, csr_b64, csr_pem, log, err = run_step1()
-        st.session_state.step1_log   = log
-        st.session_state.step1_error = err
-        if not err:
-            st.session_state.private_key_pem = pk
-            st.session_state.csr_base64      = csr_b64
-            st.session_state.csr_pem         = csr_pem
-            st.session_state.step1_done      = True
-            st.rerun()
-
-if st.session_state.step1_log:
-    cls = "result-box result-box-error" if st.session_state.step1_error else "result-box"
-    st.markdown(f'<div class="{cls}">{st.session_state.step1_log}</div>', unsafe_allow_html=True)
-
-if st.session_state.step1_done:
-    col1, col2 = st.columns(2)
-    with col1:
-        st.download_button(
-            "⬇️ Download private_key.pem",
-            data=st.session_state.private_key_pem,
-            file_name="private_key.pem",
-            mime="text/plain",
-            use_container_width=True,
-        )
-    with col2:
-        st.download_button(
-            "⬇️ Download csr.pem",
-            data=st.session_state.csr_pem,
-            file_name="csr.pem",
-            mime="text/plain",
-            use_container_width=True,
-        )
-
-st.markdown('</div>', unsafe_allow_html=True)
-
-
-# ═══════════════════════════════════════════════════════════
-# STEP 2 — Submit CSR → Get Compliance CSID
-# ═══════════════════════════════════════════════════════════
-
-step2_card_cls = (
-    "step-card step-card-done"  if st.session_state.step2_done and not st.session_state.step2_error else
-    "step-card step-card-error" if st.session_state.step2_error else
-    "step-card step-card-active" if st.session_state.step1_done else
-    "step-card"
-)
-
-st.markdown(f'<div class="{step2_card_cls}">', unsafe_allow_html=True)
-
-num_cls2 = (
-    "step-number step-number-done"   if st.session_state.step2_done else
-    "step-number step-number-active" if st.session_state.step1_done else
-    "step-number"
-)
-badge2 = (
-    '<span class="badge badge-success">✓ Complete</span>' if st.session_state.step2_done else
-    '<span class="badge badge-error">✗ Error</span>'     if st.session_state.step2_error else
-    '<span class="badge badge-running">● Ready</span>'   if st.session_state.step1_done else
-    '<span class="badge badge-pending">○ Waiting</span>'
-)
-
-st.markdown(f"""
-<div class="step-header">
-    <div class="{num_cls2}">2</div>
-    <div>
-        <div class="step-title">Submit CSR — Get Compliance CSID</div>
-        <div class="step-subtitle">Sends CSR to ZATCA Fatoora API and retrieves the Compliance Certificate Security ID</div>
-    </div>
-    <div style="margin-left:auto">{badge2}</div>
-</div>
-""", unsafe_allow_html=True)
-
-if not st.session_state.step1_done:
-    st.info("⬆️ Complete Step 1 first to unlock this step.")
-elif not st.session_state.step2_done:
-    st.caption(f"🌐 Endpoint: `{env_url}/compliance`   |   OTP: `{'•' * len(otp)}`")
-    if st.button("📤 Submit CSR to ZATCA", key="btn_step2", use_container_width=True):
-        with st.spinner("Submitting CSR to ZATCA Compliance API..."):
-            ccsid, log, err = run_step2(st.session_state.csr_base64)
-        st.session_state.step2_log   = log
-        st.session_state.step2_error = err
-        if not err:
-            st.session_state.ccsid_data = ccsid
-            st.session_state.step2_done = True
-            st.rerun()
-
-if st.session_state.step2_log:
-    cls = "result-box result-box-error" if st.session_state.step2_error else "result-box"
-    st.markdown(f'<div class="{cls}">{st.session_state.step2_log}</div>', unsafe_allow_html=True)
-
-if st.session_state.step2_done and st.session_state.ccsid_data:
-    ccsid = st.session_state.ccsid_data
-    token_preview = str(ccsid.get("binarySecurityToken", ""))[:50] + "..."
-    st.markdown(f"""
-<div class="info-grid">
-    <div class="info-item"><div class="info-label">Request ID</div><div class="info-value">{ccsid.get('requestID','—')}</div></div>
-    <div class="info-item"><div class="info-label">Binary Security Token</div><div class="info-value">{token_preview}</div></div>
-    <div class="info-item"><div class="info-label">Secret</div><div class="info-value">{'•' * 12}</div></div>
-</div>
-""", unsafe_allow_html=True)
-    ccsid_json = json.dumps(ccsid, indent=4)
-    st.download_button(
-        "⬇️ Download ccsid.json",
-        data=ccsid_json,
-        file_name="ccsid.json",
-        mime="application/json",
-    )
-
-st.markdown('</div>', unsafe_allow_html=True)
-
-
-# ═══════════════════════════════════════════════════════════
-# STEP 3 — Get Production CSID
-# ═══════════════════════════════════════════════════════════
-
-step3_card_cls = (
-    "step-card step-card-done"  if st.session_state.step3_done and not st.session_state.step3_error else
-    "step-card step-card-error" if st.session_state.step3_error else
-    "step-card step-card-active" if st.session_state.step2_done else
-    "step-card"
-)
-
-st.markdown(f'<div class="{step3_card_cls}">', unsafe_allow_html=True)
-
-num_cls3 = (
-    "step-number step-number-done"   if st.session_state.step3_done else
-    "step-number step-number-active" if st.session_state.step2_done else
-    "step-number"
-)
-badge3 = (
-    '<span class="badge badge-success">✓ Complete</span>' if st.session_state.step3_done else
-    '<span class="badge badge-error">✗ Error</span>'     if st.session_state.step3_error else
-    '<span class="badge badge-running">● Ready</span>'   if st.session_state.step2_done else
-    '<span class="badge badge-pending">○ Waiting</span>'
-)
-
-st.markdown(f"""
-<div class="step-header">
-    <div class="{num_cls3}">3</div>
-    <div>
-        <div class="step-title">Get Production CSID (PCSID)</div>
-        <div class="step-subtitle">Exchanges the Compliance CSID for a Production Certificate Security ID</div>
-    </div>
-    <div style="margin-left:auto">{badge3}</div>
-</div>
-""", unsafe_allow_html=True)
-
-if not st.session_state.step2_done:
-    st.info("⬆️ Complete Step 2 first to unlock this step.")
-elif not st.session_state.step3_done:
-    st.caption(f"🌐 Endpoint: `{env_url}/production/csids`")
-    if st.button("🏭 Request Production CSID", key="btn_step3", use_container_width=True):
-        with st.spinner("Requesting Production CSID from ZATCA..."):
-            pcsid, log, err = run_step3(st.session_state.ccsid_data)
-        st.session_state.step3_log   = log
-        st.session_state.step3_error = err
-        if not err:
-            st.session_state.pcsid_data = pcsid
-            st.session_state.step3_done = True
-            st.rerun()
-
-if st.session_state.step3_log:
-    cls = "result-box result-box-error" if st.session_state.step3_error else "result-box"
-    st.markdown(f'<div class="{cls}">{st.session_state.step3_log}</div>', unsafe_allow_html=True)
-
-if st.session_state.step3_done and st.session_state.pcsid_data:
-    pcsid = st.session_state.pcsid_data
-    token_preview = str(pcsid.get("binarySecurityToken", ""))[:50] + "..."
-    st.markdown(f"""
-<div class="info-grid">
-    <div class="info-item"><div class="info-label">Request ID</div><div class="info-value">{pcsid.get('requestID','—')}</div></div>
-    <div class="info-item"><div class="info-label">Binary Security Token</div><div class="info-value">{token_preview}</div></div>
-    <div class="info-item"><div class="info-label">Secret</div><div class="info-value">{'•' * 12}</div></div>
-</div>
-""", unsafe_allow_html=True)
-    pcsid_json = json.dumps(pcsid, indent=4)
-    st.download_button(
-        "⬇️ Download pcsid.json",
-        data=pcsid_json,
-        file_name="pcsid.json",
-        mime="application/json",
-    )
-
-st.markdown('</div>', unsafe_allow_html=True)
-
-
-# ═══════════════════════════════════════════════════════════
-# COMPLETION SUMMARY
-# ═══════════════════════════════════════════════════════════
-
-if st.session_state.step3_done:
-    st.markdown(f"""
-<div style="
-    background: linear-gradient(135deg, #0e2a1a, #132215);
-    border: 1px solid #2a5c3f;
-    border-radius: 14px;
-    padding: 28px 32px;
-    margin-top: 12px;
-    text-align: center;
-">
-    <div style="font-size:2.4rem;margin-bottom:10px">🎉</div>
-    <div style="font-size:1.3rem;font-weight:700;color:#4ec98a;margin-bottom:6px">
-        Integration Complete!
-    </div>
-    <div style="color:#5a8a6a;font-size:0.9rem">
-        All 3 steps completed successfully on <strong>{badge_info['label']}</strong>. Your Production CSID is ready for use.
-    </div>
-    <div style="display:flex;justify-content:center;gap:24px;margin-top:18px;flex-wrap:wrap">
-        <span style="color:#8a94aa;font-size:0.82rem">✅ private_key.pem</span>
-        <span style="color:#8a94aa;font-size:0.82rem">✅ csr.pem</span>
-        <span style="color:#8a94aa;font-size:0.82rem">✅ ccsid.json</span>
-        <span style="color:#8a94aa;font-size:0.82rem">✅ pcsid.json</span>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-    # ── Build settings export JSON ──
+def build_settings_export(details, s):
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    env_name_map = {
-        "🧪 Sandbox (Developer Portal)": "sandbox",
-        "🔬 Simulation": "simulation",
-        "🏭 Production": "production",
-    }
-    is_prod = "t" if "Production" in selected_env else "f"
-    ccsid = st.session_state.ccsid_data or {}
-    pcsid = st.session_state.pcsid_data or {}
-
-    settings_export = {
+    ccsid = s.ccsid or {}
+    pcsid = s.pcsid or {}
+    return {
         "company_information": {
-            "company_name": CONFIG["organization"],
-            "vat_number": CONFIG["tax_number"],
+            "company_name": details["organization"],
+            "vat_number": details["tax_number"],
             "commercial_registration_number": "",
-            "organization_identifier": CONFIG["tax_number"],
+            "organization_identifier": details["tax_number"],
             "city_name": "",
             "street_name": "",
             "building_number": "",
             "postal_code": "",
-            "country_code": CONFIG["country"],
+            "country_code": details["country"],
         },
         "solution_information": {
             "solution_name": "",
             "model_name": "",
-            "serial_number": CONFIG["serial_number"],
-            "organizational_unit_name": CONFIG["org_unit"],
-            "business_category": CONFIG["business_cat"],
-            "invoice_type": CONFIG["invoice_type"],
+            "serial_number": details["serial_number"],
+            "organizational_unit_name": details["org_unit"],
+            "business_category": details["business_cat"],
+            "invoice_type": details["invoice_type"],
         },
         "environment": {
-            "environment": env_name_map.get(selected_env, "sandbox"),
-            "is_production": is_prod,
+            "environment": details["env"],
+            "is_production": "t" if details["env"] == "production" else "f",
             "is_active": "t",
         },
         "certificates": {
             "previous_invoice_hash": "MA==",
-            "privateKey": base64.b64encode(
-                (st.session_state.private_key_pem or "").encode("utf-8")
-            ).decode("utf-8"),
-            "csr": st.session_state.csr_base64 or "",
+            "privateKey": base64.b64encode((s.private_key_pem or "").encode("utf-8")).decode("utf-8"),
+            "csr": s.csr_base64 or "",
             "ccsid_requestID": str(ccsid.get("requestID", "")),
             "ccsid_binarySecurityToken": ccsid.get("binarySecurityToken", ""),
             "ccsid_secret": ccsid.get("secret", ""),
@@ -1070,35 +508,436 @@ if st.session_state.step3_done:
             "lastICV": 0,
             "zatcaotp": 0,
         },
-        "timestamps": {
-            "created_at": now_str,
-            "updated_at": now_str,
-        },
-        "export_info": {
-            "exported_at": now_str,
-            "exported_by": "owner",
-        },
+        "timestamps": {"created_at": now_str, "updated_at": now_str},
+        "export_info": {"exported_at": now_str, "exported_by": "owner"},
     }
 
-    export_filename = f"zatca_settings_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H%M%S')}.json"
-    st.download_button(
-        "⬇️ Download Settings JSON",
-        data=json.dumps(settings_export, indent=4, ensure_ascii=False),
-        file_name=export_filename,
-        mime="application/json",
-        use_container_width=True,
-        key="btn_export_settings",
+
+def validate_details(d):
+    errors = []
+    required = {
+        "organization": "Company legal name",
+        "org_unit": "Branch or department",
+        "common_name": "Name for this invoicing system",
+        "address": "National short address",
+        "business_cat": "Business activity",
+    }
+    for key, label in required.items():
+        if not d[key].strip():
+            errors.append(f"**{label}** is required.")
+    if not re.fullmatch(r"3\d{13}3", d["tax_number"].strip()):
+        errors.append("**VAT number** must be 15 digits, starting and ending with 3 (e.g. 300000000000003).")
+    if not re.fullmatch(r"[A-Za-z]{2}", d["country"].strip()):
+        errors.append("**Country code** must be 2 letters (e.g. SA).")
+    if not re.fullmatch(r"1-[^|]+\|2-[^|]+\|3-[^|]+", d["serial_number"].strip()):
+        errors.append("**Serial number** must look like `1-Name|2-Model|3-UniqueID`.")
+    for key, value in d.items():
+        if any(ch in value for ch in "\n\r$#"):
+            errors.append("Details can't contain the characters `$` or `#`.")
+            break
+    return errors
+
+
+# ═══════════════════════════════════════════════════════════
+# UI HELPERS
+# ═══════════════════════════════════════════════════════════
+
+CHECK_ICON = '<span class="ico ico-check"></span>'
+LOGO_ICON = '<span class="ico ico-receipt"></span>'
+BIG_CHECK_ICON = '<span class="ico ico-check ico-lg"></span>'
+
+
+def esc(value):
+    return html.escape(str(value))
+
+
+def render_header(env):
+    e = ENVIRONMENTS[env]
+    st.html(f"""
+<div class="app-header">
+    <div class="app-logo">{LOGO_ICON}</div>
+    <div>
+        <div class="app-title">ZATCA E-Invoicing Setup</div>
+        <div class="app-sub">Register your invoicing system with ZATCA (Fatoora) in a few guided steps.</div>
+        <span class="env-pill env-pill-inline env-{env}">{esc(e['pill'])}</span>
+    </div>
+    <span class="env-pill env-{env}">{esc(e['pill'])}</span>
+</div>
+""")
+
+
+def render_stepper(active):
+    items = []
+    for i, label in enumerate(STEPS, start=1):
+        if i < active or active == 4:
+            cls, dot = "done", CHECK_ICON
+        elif i == active:
+            cls, dot = "current", str(i)
+        else:
+            cls, dot = "", str(i)
+        items.append(
+            f'<div class="st-item {cls}"><div class="st-dot">{dot}</div>'
+            f'<div class="st-label">{esc(label)}</div></div>'
+        )
+    st.html(f'<div class="stepper">{"".join(items)}</div>')
+
+
+def step_heading(num, title, desc, state):
+    tags = {
+        "done": ("tag-done", "Done"),
+        "current": ("tag-current", "Your next step"),
+        "locked": ("tag-locked", "Locked"),
+    }
+    tag_cls, tag_text = tags[state]
+    num_html = CHECK_ICON if state == "done" else str(num)
+    st.html(f"""
+<div class="step-head">
+    <div class="step-num {state}">{num_html}</div>
+    <div>
+        <div class="step-title">{esc(title)}</div>
+        <div class="step-desc">{desc}</div>
+    </div>
+    <span class="step-tag {tag_cls}">{tag_text}</span>
+</div>
+""")
+
+
+def step_state(num, active):
+    if num < active:
+        return "done"
+    return "current" if num == active else "locked"
+
+
+def show_error(step):
+    err = st.session_state.error
+    if err and err["step"] == step:
+        st.error(err["message"], icon=":material/error:")
+        if err.get("log"):
+            with st.expander("Technical details (for your IT support)"):
+                st.code(err["log"], language=None)
+
+
+# ═══════════════════════════════════════════════════════════
+# PAGE
+# ═══════════════════════════════════════════════════════════
+
+s = st.session_state
+form = s.form
+active = current_step()
+# The header is drawn before the environment radio, so read the radio's latest value directly.
+env_for_header = s.details["env"] if s.details else s.get("env_choice", form["env"])
+
+render_header(env_for_header)
+render_stepper(active)
+
+
+# ── STEP 1 · Business details ──────────────────────────────
+
+state1 = step_state(1, active)
+with st.container(border=True, key=f"card-{state1}-1"):
+    step_heading(
+        1, "Tell us about your business",
+        "These details go into your certificate, so they must match your ZATCA registration.",
+        state1,
     )
 
+    if state1 == "current":
+        st.html('<div class="section-label">Where do you want to register?</div>')
+        env_keys = list(ENVIRONMENTS)
+        form["env"] = st.radio(
+            "Where do you want to register?",
+            env_keys,
+            index=env_keys.index(form["env"]),
+            format_func=lambda k: ENVIRONMENTS[k]["label"],
+            captions=[ENVIRONMENTS[k]["caption"] for k in env_keys],
+            label_visibility="collapsed",
+            key="env_choice",
+        )
 
-# ═══════════════════════════════════════════════════════════
-# FOOTER
-# ═══════════════════════════════════════════════════════════
+        if form["env"] != "sandbox" and form["tax_number"] == SAMPLE_VAT:
+            st.warning(
+                "The fields below still contain **sample data**. Replace them with your "
+                "real business details before continuing.",
+                icon=":material/edit_note:",
+            )
 
-st.markdown(f"""
-<div style="margin-top:40px;padding-top:16px;border-top:1px solid #1e2330;
-            text-align:center;color:#3a4255;font-size:0.78rem">
-    ZATCA E-Invoicing · Fatoora Platform · {badge_info['label'].title()} Environment
-    &nbsp;·&nbsp; UBL 2.1 &nbsp;·&nbsp; secp256k1 &nbsp;·&nbsp; SHA-256
+        st.html('<div class="section-label">Your business</div>')
+        with st.form("details_form", border=False):
+            c1, c2 = st.columns(2)
+            organization = c1.text_input(
+                "Company legal name", value=form["organization"],
+                help="Exactly as it appears on your VAT registration.",
+            )
+            org_unit = c2.text_input(
+                "Branch or department", value=form["org_unit"],
+                help="The branch that will issue invoices, e.g. Riyadh Branch.",
+            )
+            c3, c4 = st.columns(2)
+            tax_number = c3.text_input(
+                "VAT number", value=form["tax_number"], max_chars=15,
+                help="Your 15-digit VAT registration number. It starts and ends with 3.",
+            )
+            type_keys = list(INVOICE_TYPES)
+            invoice_type = c4.selectbox(
+                "Which invoices will you issue?", type_keys,
+                index=type_keys.index(form["invoice_type"]),
+                format_func=lambda k: INVOICE_TYPES[k],
+                help="Tax invoices are for business customers; simplified invoices are "
+                     "for regular shoppers (like a receipt).",
+            )
+            c5, c6 = st.columns(2)
+            address = c5.text_input(
+                "National short address", value=form["address"],
+                help="Your 8-character Saudi National Address short code, e.g. RRRD2929.",
+            )
+            business_cat = c6.text_input(
+                "Business activity", value=form["business_cat"],
+                help="What your business does, e.g. Retail, Restaurant, Supply activities.",
+            )
+            common_name = st.text_input(
+                "Name for this invoicing system", value=form["common_name"],
+                help="Any name that identifies this POS or accounting system, e.g. Main-Store-POS.",
+            )
+            with st.expander("Advanced settings (optional, most people can skip this)"):
+                serial_number = st.text_input(
+                    "Device serial number", value=form["serial_number"],
+                    help="Format: 1-SolutionName|2-ModelOrVersion|3-UniqueID. A unique one is "
+                         "generated for you.",
+                )
+                country = st.text_input("Country code", value=form["country"], max_chars=2)
+
+            submitted = st.form_submit_button(
+                "Save and continue", type="primary", width="stretch",
+                icon=":material/arrow_forward:", icon_position="right",
+            )
+
+        if submitted:
+            new_values = {
+                "env": form["env"],
+                "organization": organization.strip(),
+                "org_unit": org_unit.strip(),
+                "tax_number": tax_number.strip(),
+                "invoice_type": invoice_type,
+                "address": address.strip(),
+                "business_cat": business_cat.strip(),
+                "common_name": common_name.strip(),
+                "serial_number": serial_number.strip(),
+                "country": country.strip().upper(),
+            }
+            form.update(new_values)
+            problems = validate_details(new_values)
+            if problems:
+                st.error("Please fix the following:\n\n" + "\n".join(f"- {p}" for p in problems),
+                         icon=":material/error:")
+            else:
+                clear_progress()
+                s.details = dict(new_values)
+                if new_values["env"] == "sandbox":
+                    s.otp = SANDBOX_OTP
+                elif s.otp == SANDBOX_OTP:
+                    s.otp = ""
+                st.rerun()
+
+    elif state1 == "done":
+        d = s.details
+        left, right = st.columns([5, 1], vertical_alignment="center")
+        left.markdown(
+            f"**{d['organization']}** · VAT {d['tax_number']}  \n"
+            f":gray[{ENVIRONMENTS[d['env']]['label']} · {d['org_unit']}]"
+        )
+        if active < 4:
+            if right.button("Edit", type="tertiary", icon=":material/edit:",
+                            help="Change your details. You'll need to redo the next steps."):
+                clear_progress()
+                st.rerun()
+
+
+# ── STEP 2 · Verify with OTP ──────────────────────────────
+
+state2 = step_state(2, active)
+with st.container(border=True, key=f"card-{state2}-2"):
+    step_heading(
+        2, "Verify with a one-time password",
+        "ZATCA uses a short code (OTP) to confirm that you own this VAT number.",
+        state2,
+    )
+
+    if state2 == "current":
+        env = s.details["env"]
+        if env == "sandbox":
+            st.info(
+                f"You're in practice mode, so the test code **{SANDBOX_OTP}** is already filled in. "
+                "Just press the button below.",
+                icon=":material/lightbulb:",
+            )
+        else:
+            portal = "Simulation portal" if env == "simulation" else "main Fatoora portal"
+            st.html(f"""
+<div class="howto">
+    <b>How to get your code</b>
+    <ol>
+        <li>Sign in at <a href="https://fatoora.zatca.gov.sa" target="_blank">fatoora.zatca.gov.sa</a>
+            with your ZATCA account and open the {portal}.</li>
+        <li>Choose <b>Onboard new solution unit / device</b>.</li>
+        <li>Enter <b>1</b> as the number of codes and click <b>Generate OTP code</b>.</li>
+        <li>Copy the 6-digit code into the box below. It expires after <b>1 hour</b>.</li>
+    </ol>
 </div>
-""", unsafe_allow_html=True)
+""")
+
+        s.otp = st.text_input(
+            "One-time password (OTP)", value=s.otp, max_chars=6, placeholder="6-digit code",
+        ).strip()
+
+        if st.button("Register with ZATCA", type="primary", width="stretch",
+                     icon=":material/verified_user:"):
+            s.error = None
+            if not re.fullmatch(r"\d{6}", s.otp):
+                s.error = {"step": 2, "message": "The OTP should be exactly 6 digits.", "log": ""}
+            else:
+                with st.spinner("Creating your secure key and contacting ZATCA..."):
+                    log_parts = []
+                    if s.csr_base64 is None:
+                        keys, err, log = generate_key_and_csr(s.details)
+                        log_parts.append(log)
+                        if err:
+                            s.error = {"step": 2, "message": err, "log": "\n".join(log_parts)}
+                        else:
+                            s.private_key_pem = keys["private_key_pem"]
+                            s.csr_pem = keys["csr_pem"]
+                            s.csr_base64 = keys["csr_base64"]
+                    if s.error is None:
+                        ccsid, err, log = request_compliance_csid(env, s.csr_base64, s.otp)
+                        log_parts.append(log)
+                        s.log[2] = "\n".join(log_parts)
+                        if err:
+                            s.error = {"step": 2, "message": err, "log": s.log[2]}
+                        else:
+                            s.ccsid = ccsid
+            st.rerun()
+
+        show_error(2)
+
+    elif state2 == "done":
+        st.markdown(f"Verified. ZATCA issued your compliance certificate "
+                    f":gray[(request {s.ccsid.get('requestID', '—')})].")
+
+    else:
+        st.caption("Unlocks after you save your business details.")
+
+
+# ── STEP 3 · Activate ──────────────────────────────────────
+
+state3 = step_state(3, active)
+with st.container(border=True, key=f"card-{state3}-3"):
+    step_heading(
+        3, "Activate your certificate",
+        "Swap your trial certificate for the one you'll use to sign real invoices.",
+        state3,
+    )
+
+    if state3 == "current":
+        if s.details["env"] != "sandbox":
+            st.info(
+                "In Simulation and Live, ZATCA first expects your invoicing software to send a few "
+                "sample invoices (compliance checks). If activation fails for that reason, finish "
+                "those checks and press the button again.",
+                icon=":material/info:",
+            )
+        if st.button("Activate my certificate", type="primary", width="stretch",
+                     icon=":material/rocket_launch:"):
+            s.error = None
+            with st.spinner("Activating with ZATCA..."):
+                pcsid, err, log = request_production_csid(s.details["env"], s.ccsid)
+            s.log[3] = log
+            if err:
+                s.error = {"step": 3, "message": err, "log": log}
+            else:
+                s.pcsid = pcsid
+            st.rerun()
+
+        show_error(3)
+
+    elif state3 == "done":
+        st.markdown(f"Activated. Your production certificate is ready "
+                    f":gray[(request {s.pcsid.get('requestID', '—')})].")
+
+    else:
+        st.caption("Unlocks after ZATCA verifies your OTP.")
+
+
+# ── STEP 4 · Download ──────────────────────────────────────
+
+state4 = "current" if active == 4 else "locked"
+with st.container(border=True, key=f"card-{state4}-4"):
+    if active == 4:
+        d = s.details
+        st.html(f"""
+<div class="success-panel">
+    <div class="success-icon">{BIG_CHECK_ICON}</div>
+    <div class="success-title">You're all set!</div>
+    <div class="success-text">
+        <b>{esc(d['organization'])}</b> is registered with ZATCA
+        ({esc(ENVIRONMENTS[d['env']]['label'])}).<br>
+        Download your settings file and load it into your invoicing system.
+    </div>
+</div>
+""")
+        export_name = f"zatca_settings_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H%M%S')}.json"
+        st.download_button(
+            "Download settings file",
+            data=json.dumps(build_settings_export(d, s), indent=4, ensure_ascii=False),
+            file_name=export_name,
+            mime="application/json",
+            type="primary",
+            width="stretch",
+            icon=":material/download:",
+            on_click="ignore",
+        )
+        st.warning(
+            "Keep this file private. It contains your secret key: anyone who has it "
+            "can sign invoices in your company's name.",
+            icon=":material/lock:",
+        )
+        with st.expander("Individual files (for developers)"):
+            files = [
+                ("private_key.pem", s.private_key_pem, "text/plain"),
+                ("csr.pem", s.csr_pem, "text/plain"),
+                ("ccsid.json", json.dumps(s.ccsid, indent=4), "application/json"),
+                ("pcsid.json", json.dumps(s.pcsid, indent=4), "application/json"),
+            ]
+            cols = st.columns(2)
+            for i, (name, data, mime) in enumerate(files):
+                cols[i % 2].download_button(
+                    name, data=data, file_name=name, mime=mime, width="stretch",
+                    icon=":material/description:", on_click="ignore", key=f"dl-{name}",
+                )
+    else:
+        step_heading(
+            4, "Download your settings",
+            "Get the file your invoicing system needs to start signing invoices.",
+            "locked",
+        )
+        st.caption("Unlocks after activation.")
+
+
+# ── Start over & footer ────────────────────────────────────
+
+if s.details is not None:
+    _, mid, _ = st.columns([1, 2, 1])
+    with mid.popover("Start over", icon=":material/restart_alt:", type="tertiary", width="stretch"):
+        st.markdown("This clears everything on this page, including any certificates you "
+                    "haven't downloaded.")
+        if st.button("Yes, start over", type="primary", width="stretch"):
+            clear_progress()
+            st.session_state.form = default_form()
+            st.session_state.otp = SANDBOX_OTP
+            st.session_state.pop("env_choice", None)
+            st.rerun()
+
+st.html("""
+<div class="app-footer">
+    Connects directly to ZATCA's official Fatoora API. Your details and keys exist only for
+    this session and are never saved to disk. Close the tab and they're gone.
+</div>
+""")
